@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-私人健身教练 - 每日飞书提醒
-按周几自动生成对应的训练+饮食计划，发送到飞书 webhook。
-用法: python3 coach/daily_reminder.py [--day 1-7] [--webhook URL]
+私人健身教练 - 每日健身提醒（飞书 + Telegram）
+按周几自动生成对应的训练+饮食计划，发送到飞书 webhook 和/或 Telegram。
+用法:
+  python3 coach/daily_reminder.py [--day 1-7] [--channel feishu|telegram|all]
+  python3 coach/daily_reminder.py --get-chat-id   # 获取 Telegram chat ID
 """
 
 import json
@@ -10,7 +12,9 @@ import urllib.request
 import argparse
 from datetime import datetime
 
-WEBHOOK_URL = "https://open.feishu.cn/open-apis/bot/v2/hook/4d3e23b0-6eee-4bdb-83f7-0164f0a3d135"
+FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/4d3e23b0-6eee-4bdb-83f7-0164f0a3d135"
+TELEGRAM_BOT_TOKEN = "7644925383:AAFL76qGApRLnIGwOvc7kWMgoQrbU3orS_g"
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 # 7天训练计划：肌群轮换，周三/日休息
 WEEKLY_PLAN = {
@@ -229,8 +233,77 @@ def send_to_feishu(webhook_url: str, payload: dict) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+# ── Telegram ─────────────────────────────────────────────
+
+def telegram_api(method: str, params: dict | None = None) -> dict:
+    """调用 Telegram Bot API"""
+    url = f"{TELEGRAM_API}/{method}"
+    data = json.dumps(params or {}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def get_telegram_chat_id() -> int | None:
+    """从最近的 updates 中获取 chat ID"""
+    result = telegram_api("getUpdates")
+    for update in result.get("result", []):
+        msg = update.get("message")
+        if msg:
+            return msg["chat"]["id"]
+    return None
+
+
+def build_telegram_text(day_of_week: int) -> str:
+    """将训练计划转为 Telegram Markdown 格式的纯文本"""
+    plan = WEEKLY_PLAN[day_of_week]
+    is_rest = plan.get("is_rest", False)
+    meal = MEAL_PLAN["rest"] if is_rest else MEAL_PLAN["training"]
+
+    lines = []
+    emoji = "🛋️" if is_rest else "🏋️"
+    lines.append(f"{emoji} *{plan['title']}*\n")
+
+    if not is_rest:
+        lines.append(f"🔥 *热身（5分钟）*\n{plan['warmup']}\n")
+        lines.append(f"💪 *正式训练（约{plan['duration']}分钟）*\n{plan['workout']}\n")
+        lines.append(f"🧘 *拉伸（5分钟）*\n{plan['stretch']}\n")
+    else:
+        lines.append(plan["workout"].replace("**", "*") + "\n")
+
+    lines.append(f"🍽️ *今日饮食（目标 {meal['target']}）*\n")
+    lines.append(meal["meals"].replace("**", "*") + "\n")
+
+    if not is_rest:
+        lines.append(
+            "⏰ *训练提示*\n"
+            "- 组间休息60-90秒\n"
+            "- 注意动作标准，控制离心阶段\n"
+            "- 每组最后2次应感到吃力但能完成\n"
+            "- 训练后30分钟内补充蛋白质"
+        )
+
+    return "\n".join(lines)
+
+
+def send_to_telegram(chat_id: int, day_of_week: int) -> dict:
+    """发送训练计划到 Telegram"""
+    text = build_telegram_text(day_of_week)
+    return telegram_api("sendMessage", {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown",
+    })
+
+
+# ── Main ─────────────────────────────────────────────────
+
 def main():
-    parser = argparse.ArgumentParser(description="私人教练 - 每日飞书健身提醒")
+    parser = argparse.ArgumentParser(description="私人教练 - 每日健身提醒（飞书 + Telegram）")
     parser.add_argument(
         "--day",
         type=int,
@@ -239,29 +312,77 @@ def main():
         help="指定周几 (1=周一..7=周日)，默认自动检测",
     )
     parser.add_argument(
+        "--channel",
+        type=str,
+        choices=["feishu", "telegram", "all"],
+        default="all",
+        help="发送渠道: feishu / telegram / all（默认）",
+    )
+    parser.add_argument(
         "--webhook",
         type=str,
-        default=WEBHOOK_URL,
+        default=FEISHU_WEBHOOK,
         help="飞书 webhook URL",
+    )
+    parser.add_argument(
+        "--chat-id",
+        type=int,
+        default=None,
+        help="Telegram chat ID（不指定则自动检测）",
+    )
+    parser.add_argument(
+        "--get-chat-id",
+        action="store_true",
+        help="获取 Telegram chat ID 后退出（需先给 bot 发 /start）",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="仅输出卡片 JSON，不发送",
+        help="仅输出内容，不发送",
     )
     args = parser.parse_args()
 
-    day = args.day or datetime.now().isoweekday()  # 1=Mon..7=Sun
-    payload = build_card(day)
-
-    if args.dry_run:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    # 仅获取 chat ID
+    if args.get_chat_id:
+        cid = get_telegram_chat_id()
+        if cid:
+            print(f"Telegram chat ID: {cid}")
+        else:
+            print("未找到 chat ID，请先在 Telegram 给 bot 发送 /start")
         return
 
-    result = send_to_feishu(args.webhook, payload)
-    status = "✅ 发送成功" if result.get("code") == 0 else f"❌ 发送失败: {result}"
+    day = args.day or datetime.now().isoweekday()
     plan_title = WEEKLY_PLAN[day]["title"]
-    print(f"{status} | {plan_title}")
+
+    if args.dry_run:
+        if args.channel in ("feishu", "all"):
+            print("=== 飞书卡片 ===")
+            print(json.dumps(build_card(day), ensure_ascii=False, indent=2))
+        if args.channel in ("telegram", "all"):
+            print("\n=== Telegram 消息 ===")
+            print(build_telegram_text(day))
+        return
+
+    results = []
+
+    # 飞书
+    if args.channel in ("feishu", "all"):
+        payload = build_card(day)
+        r = send_to_feishu(args.webhook, payload)
+        ok = r.get("code") == 0
+        results.append(f"飞书: {'✅' if ok else '❌'}")
+
+    # Telegram
+    if args.channel in ("telegram", "all"):
+        chat_id = args.chat_id or get_telegram_chat_id()
+        if chat_id:
+            r = send_to_telegram(chat_id, day)
+            ok = r.get("ok", False)
+            results.append(f"Telegram: {'✅' if ok else '❌'}")
+        else:
+            results.append("Telegram: ⚠️ 无 chat ID（请先给 bot 发 /start）")
+
+    print(f"{' | '.join(results)} | {plan_title}")
 
 
 if __name__ == "__main__":
