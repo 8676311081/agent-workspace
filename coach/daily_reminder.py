@@ -15,6 +15,7 @@ from datetime import datetime
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/4d3e23b0-6eee-4bdb-83f7-0164f0a3d135"
 TELEGRAM_BOT_TOKEN = "7644925383:AAFL76qGApRLnIGwOvc7kWMgoQrbU3orS_g"
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+TELEGRAM_CHAT_ID = 7989947975
 
 # 7天训练计划：肌群轮换，周三/日休息
 WEEKLY_PLAN = {
@@ -374,7 +375,7 @@ def main():
 
     # Telegram
     if args.channel in ("telegram", "all"):
-        chat_id = args.chat_id or get_telegram_chat_id()
+        chat_id = args.chat_id or TELEGRAM_CHAT_ID or get_telegram_chat_id()
         if chat_id:
             r = send_to_telegram(chat_id, day)
             ok = r.get("ok", False)
