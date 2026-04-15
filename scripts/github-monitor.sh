@@ -7,6 +7,7 @@ set -euo pipefail
 REPO="8676311081/cabinet"
 STATE_FILE="/tmp/cabinet-github-stats.json"
 FEISHU_WEBHOOK="https://open.feishu.cn/open-apis/bot/v2/hook/b4ba7fd0-f3b6-42e8-8a34-ba139f5e0f64"
+REPORT_INTERVAL=18000  # 5 小时（秒）— 定期发送完整状态报告
 
 # ---------- 采集当前数据 ----------
 
@@ -57,7 +58,10 @@ current=$(jq -n \
 
 # ---------- 对比上次 ----------
 
+now_epoch=$(date +%s)
+
 if [[ ! -f "$STATE_FILE" ]]; then
+  current=$(echo "$current" | jq --argjson lr "$now_epoch" '. + {last_report_at: $lr}')
   echo "$current" > "$STATE_FILE"
   echo "首次运行，已保存初始状态到 $STATE_FILE"
   exit 0
@@ -116,34 +120,27 @@ if (( discussions_count != prev_discussions )); then
   fi
 fi
 
-# ---------- 发送通知 ----------
+# ---------- 发送飞书卡片的通用函数 ----------
 
-if (( ${#changes[@]} == 0 )); then
-  echo "$(date): 无变化"
-  # 仍然更新时间戳
-  echo "$current" > "$STATE_FILE"
-  exit 0
-fi
+send_feishu_card() {
+  local title="$1"
+  local template="$2"
+  local body_text="$3"
 
-body=""
-for c in "${changes[@]}"; do
-  body="${body}${c}\n"
-done
-body="${body}\n📊 当前: ⭐${stars}  🍴${forks}  📦${dmg_downloads} 下载  💬${discussions_count} 讨论"
+  local body_escaped
+  body_escaped=$(echo -e "$body_text" | jq -Rs .)
 
-# 转义 JSON 特殊字符
-body_escaped=$(echo -e "$body" | jq -Rs .)
-
-card_json=$(cat <<ENDJSON
+  local card_json
+  card_json=$(cat <<ENDJSON
 {
   "msg_type": "interactive",
   "card": {
     "header": {
       "title": {
-        "content": "Cabinet GitHub 动态",
+        "content": "${title}",
         "tag": "plain_text"
       },
-      "template": "blue"
+      "template": "${template}"
     },
     "elements": [
       {
@@ -168,15 +165,70 @@ card_json=$(cat <<ENDJSON
 ENDJSON
 )
 
-http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$FEISHU_WEBHOOK" \
-  -H 'Content-Type: application/json' \
-  -d "$card_json")
+  local http_code
+  http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$FEISHU_WEBHOOK" \
+    -H 'Content-Type: application/json' \
+    -d "$card_json")
+  echo "$http_code"
+}
 
-if [[ "$http_code" == "200" ]]; then
-  echo "$(date): 通知已发送 — ${#changes[@]} 项变化"
+# ---------- 检查是否需要定期报告 ----------
+
+last_report_at=$(echo "$prev" | jq -r '.last_report_at // 0')
+time_since_report=$((now_epoch - last_report_at))
+need_report=false
+if (( time_since_report >= REPORT_INTERVAL )); then
+  need_report=true
+fi
+
+# ---------- 发送变化通知 ----------
+
+if (( ${#changes[@]} > 0 )); then
+  body=""
+  for c in "${changes[@]}"; do
+    body="${body}${c}\n"
+  done
+  body="${body}\n📊 当前: ⭐${stars}  🍴${forks}  📦${dmg_downloads} 下载  💬${discussions_count} 讨论"
+
+  http_code=$(send_feishu_card "Cabinet GitHub 动态" "blue" "$body")
+  if [[ "$http_code" == "200" ]]; then
+    echo "$(date): 变化通知已发送 — ${#changes[@]} 项变化"
+  else
+    echo "$(date): 飞书通知失败 (HTTP $http_code)" >&2
+  fi
 else
-  echo "$(date): 飞书通知失败 (HTTP $http_code)" >&2
+  echo "$(date): 无变化"
+fi
+
+# ---------- 定期全量报告（每 5 小时） ----------
+
+if [[ "$need_report" == "true" ]]; then
+  report="**📊 Cabinet GitHub 状态报告**\n\n"
+  report+="⭐ Stars: ${stars}\n"
+  report+="🍴 Forks: ${forks}\n"
+  report+="📦 DMG 下载总量: ${dmg_downloads}\n"
+  report+="🚀 最新 Release: ${latest_release}\n"
+  report+="🐛 Open Issues: ${open_issues}\n"
+  report+="💬 Discussions: ${discussions_count}\n"
+
+  if [[ -n "$issue_titles" ]]; then
+    report+="\n**Open Issues:**\n${issue_titles}\n"
+  fi
+  if [[ -n "$discussion_titles" ]]; then
+    report+="\n**最新 Discussions:**\n${discussion_titles}\n"
+  fi
+
+  report+="\n---\n_定期报告，每 5 小时发送一次_"
+
+  http_code=$(send_feishu_card "Cabinet GitHub 状态报告" "green" "$report")
+  if [[ "$http_code" == "200" ]]; then
+    echo "$(date): 定期状态报告已发送"
+    now_epoch=$(date +%s)  # 刷新时间
+  else
+    echo "$(date): 定期报告发送失败 (HTTP $http_code)" >&2
+  fi
 fi
 
 # ---------- 保存状态 ----------
+current=$(echo "$current" | jq --argjson lr "$now_epoch" '. + {last_report_at: $lr}')
 echo "$current" > "$STATE_FILE"
