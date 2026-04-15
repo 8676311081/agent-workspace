@@ -25,6 +25,22 @@ open_issues=$(echo "$issues_json" | jq '[.[] | select(.pull_request == null)] | 
 # 收集 issue 标题用于通知
 issue_titles=$(echo "$issues_json" | jq -r '[.[] | select(.pull_request == null) | "#\(.number) \(.title)"] | join("\n")')
 
+# 获取 Discussions（建议/反馈）
+OWNER="${REPO%%/*}"
+REPO_NAME="${REPO##*/}"
+discussions_json=$(gh api graphql -f query='
+  query($owner:String!, $repo:String!) {
+    repository(owner:$owner, name:$repo) {
+      discussions(first:20, orderBy:{field:CREATED_AT, direction:DESC}) {
+        totalCount
+        nodes { number title createdAt category { name } }
+      }
+    }
+  }' -f owner="$OWNER" -f repo="$REPO_NAME" 2>/dev/null || echo '{}')
+discussions_count=$(echo "$discussions_json" | jq '.data.repository.discussions.totalCount // 0')
+# 最新 5 条 discussion 标题，用于通知新增时展示
+discussion_titles=$(echo "$discussions_json" | jq -r '[.data.repository.discussions.nodes[]? | "#\(.number) [\(.category.name)] \(.title)"] | .[0:5] | join("\n")')
+
 # ---------- 组装当前状态 ----------
 
 current=$(jq -n \
@@ -34,8 +50,10 @@ current=$(jq -n \
   --arg latest_release "$latest_release" \
   --argjson open_issues "$open_issues" \
   --arg issue_titles "$issue_titles" \
+  --argjson discussions "$discussions_count" \
+  --arg discussion_titles "$discussion_titles" \
   --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  '{stars:$stars, forks:$forks, dmg_downloads:$dmg_downloads, latest_release:$latest_release, open_issues:$open_issues, issue_titles:$issue_titles, updated_at:$ts}')
+  '{stars:$stars, forks:$forks, dmg_downloads:$dmg_downloads, latest_release:$latest_release, open_issues:$open_issues, issue_titles:$issue_titles, discussions:$discussions, discussion_titles:$discussion_titles, updated_at:$ts}')
 
 # ---------- 对比上次 ----------
 
@@ -51,6 +69,7 @@ prev_forks=$(echo "$prev" | jq -r '.forks // 0')
 prev_dmg=$(echo "$prev" | jq -r '.dmg_downloads // 0')
 prev_release=$(echo "$prev" | jq -r '.latest_release // "none"')
 prev_issues=$(echo "$prev" | jq -r '.open_issues // 0')
+prev_discussions=$(echo "$prev" | jq -r '.discussions // 0')
 
 changes=()
 
@@ -85,6 +104,18 @@ if (( open_issues != prev_issues )); then
   fi
 fi
 
+if (( discussions_count != prev_discussions )); then
+  diff=$((discussions_count - prev_discussions))
+  if (( diff > 0 )); then
+    changes+=("💬 新增 ${diff} 条 Discussion (当前 ${discussions_count} 条)")
+    if [[ -n "$discussion_titles" ]]; then
+      changes+=("   最新: $(echo "$discussion_titles" | head -n3 | tr '\n' ' ')")
+    fi
+  else
+    changes+=("💬 Discussions: ${prev_discussions} → ${discussions_count}")
+  fi
+fi
+
 # ---------- 发送通知 ----------
 
 if (( ${#changes[@]} == 0 )); then
@@ -98,7 +129,7 @@ body=""
 for c in "${changes[@]}"; do
   body="${body}${c}\n"
 done
-body="${body}\n📊 当前: ⭐${stars}  🍴${forks}  📦${dmg_downloads} 下载"
+body="${body}\n📊 当前: ⭐${stars}  🍴${forks}  📦${dmg_downloads} 下载  💬${discussions_count} 讨论"
 
 # 转义 JSON 特殊字符
 body_escaped=$(echo -e "$body" | jq -Rs .)
